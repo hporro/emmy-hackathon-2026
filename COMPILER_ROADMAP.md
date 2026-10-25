@@ -3,3 +3,7 @@
 - It passes the 4 tests for the phase 1.
 - Seems to have a good structure, altough not as simple as possible.
 - claude also made the run_all.py script in order to run the tests easily.
+
+### V0.0.2
+- Asked claude to complete the other phases, while keeping the code as simple as possible. Now it only makes a emmiter class with a static prologue.
+- It passes all tests.

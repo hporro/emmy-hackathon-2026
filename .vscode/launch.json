@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug with argument",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/compile.py",
+            "console": "integratedTerminal",
+            "args": [
+                "${workspaceFolder}/problems/p00_scalar_add/k_add_pointwise.ir.json"
+            ]
+        }
+    ]
+}
