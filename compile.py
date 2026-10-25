@@ -5,20 +5,25 @@
 How it is organised
 -------------------
 main() loads the IR and meta.json; PTXEmitter walks the kernel body and
-appends PTX lines. There are exactly three extension points:
+appends PTX lines. Every IR node kind is lowered by its own class:
 
-    IR statement  X   ->  method  do_X(self, stmt)
-    IR expression X   ->  method  ex_X(self, expr)
+    IR statement  X   ->  class XStatement(Statement, kind="X")   with generate()
+    IR expression X   ->  class XExpression(Expression, kind="X") with generate()
     elementwise op    ->  one entry in F32_OPS
 
-Adding support for something new means adding one of those; nothing else
+Subclasses register themselves through `kind=`, so adding support for
+something new means adding one class (or one F32_OPS entry); nothing else
 has to change. An unknown kind raises a clear NotImplementedError.
+
+PTXEmitter keeps the shared state and the plumbing (registers, labels,
+memory addressing, output). Lowering classes get the emitter as `self.em`
+and the IR node as `self.node`.
 
 Where values live
 -----------------
-    self.vals  IR value name   -> f32 register (%f)
-    self.idx   axis/index name -> s32 register (%r) or a Python int (folded)
-    self.ptr   buffer name     -> base address (%rd)
+    em.vals  IR value name   -> f32 register (%f)
+    em.idx   axis/index name -> s32 register (%r) or a Python int (folded)
+    em.ptr   buffer name     -> base address (%rd)
 
 Registers are handed out fresh and never reused; ptxas does the real
 allocation. Rebinding a name (Accum, or Assign to an existing name) writes
@@ -36,7 +41,8 @@ import operator
 import struct
 import sys
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional, Sequence, TypeAlias, TypeGuard, Union
+from typing import (Any, Callable, ClassVar, Iterator, Optional, Sequence, TypeAlias,
+                    TypeGuard, Union)
 
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.kernel.ir import KernelOp
@@ -224,6 +230,13 @@ def group(regs: Sequence[Reg]) -> str:            # "%f1" or "{%f1, %f2}"
     return regs[0] if len(regs) == 1 else "{" + ", ".join(regs) + "}"
 
 
+SPECIAL_REGS = {"thread_idx": "tid", "block_idx": "ctaid", "block_dim": "ntid", "grid_dim": "nctaid"}
+
+
+# =============================================================================
+# Emitter: shared state and plumbing. Node-specific logic lives in the
+# Expression / Statement subclasses further down.
+# =============================================================================
 class PTXEmitter:
     graph: Graph
     kop: KernelOp
@@ -256,7 +269,7 @@ class PTXEmitter:
         self.inits = set()                        # Init-declared names (never reseeded)
 
     # =========================================================================
-    # Plumbing: registers, labels, output, dispatch
+    # Plumbing: registers, labels, output
     # =========================================================================
     def reg(self, kind: str) -> Reg:
         self.count[kind] += 1
@@ -271,17 +284,6 @@ class PTXEmitter:
 
     def emit(self, *lines: str) -> None:
         self.lines.extend(l if l.endswith(":") else "\t" + l for l in lines)
-
-    def dispatch(self, prefix: str, node: Union[Stmt, Expr]) -> Any:
-        kind: str = type(node).__name__
-        handler: Optional[Callable[[Any], Any]] = getattr(self, prefix + kind, None)
-        if handler is None:
-            raise NotImplementedError(f"Kernel IR node {kind} (add {prefix}{kind})")
-        return handler(node)
-
-    def body(self, stmts: Body) -> None:
-        for s in stmts or ():
-            self.dispatch("do_", s)
 
     def op(self, name: str, d: Reg, *args: Reg) -> None:
         """d = name(args) on f32 registers, using F32_OPS."""
@@ -299,45 +301,19 @@ class PTXEmitter:
             self.vals[name] = reg
 
     # =========================================================================
-    # Expressions -> Python int (folded), %r register, or %p predicate
+    # Lowering entry points
     # =========================================================================
     def expr(self, e: Expr) -> IdxValue:
-        return self.dispatch("ex_", e)
+        """Lower an IR expression -> Python int (folded), %r register, or %p predicate."""
+        return Expression.lower(self, e)
 
-    def ex_Literal(self, e: Expr) -> int:
-        return int(e.value)
+    def stmt(self, s: Stmt) -> None:
+        """Lower one IR statement."""
+        Statement.lower(self, s)
 
-    def ex_Var(self, e: Expr) -> IdxValue:
-        return self.idx[e.name]
-
-    def ex_TernaryExpr(self, e: Expr) -> IdxValue:   # c ? a : b  ->  selp
-        c: IdxValue = self.expr(e.cond)
-        if not is_reg(c):
-            return self.expr(e.if_true if c else e.if_false)
-        a: IdxValue = self.expr(e.if_true)
-        b: IdxValue = self.expr(e.if_false)
-        d: Reg = self.reg("r")
-        self.emit(f"selp.b32 {d}, {a}, {b}, {self.pred(c)};")
-        return d
-
-    def ex_BinaryExpr(self, e: Expr) -> IdxValue:
-        l: IdxValue = self.expr(e.left)
-        r: IdxValue = self.expr(e.right)
-        if not is_reg(l) and not is_reg(r):
-            return FOLD[e.op](l, r)
-        if e.op in CMP_OPS:
-            p: Reg = self.reg("p")
-            self.emit(f"setp.{CMP_OPS[e.op][0]}.s32 {p}, {l}, {r};")
-            return p
-        if e.op in LOGIC_OPS:
-            p = self.reg("p")
-            self.emit(f"{LOGIC_OPS[e.op][0]} {p}, {self.pred(l)}, {self.pred(r)};")
-            return p
-        if (e.op, r) in (("+", 0), ("*", 1)):    # x+0, x*1
-            return l
-        d: Reg = self.reg("r")
-        self.emit(f"{INT_OPS[e.op][0]} {d}, {l}, {r};")
-        return d
+    def body(self, stmts: Body) -> None:
+        for s in stmts or ():
+            self.stmt(s)
 
     def pred(self, v: IdxValue) -> Reg:
         """Turn an expr() result into a predicate register."""
@@ -407,253 +383,6 @@ class PTXEmitter:
             self.emit(f"st.{space}{vec(vals)}.f32 {mem(base, off)}, {group(vals)};")
 
     # =========================================================================
-    # Statements: launch
-    # =========================================================================
-    def do_Tile(self, t: Stmt) -> None:
-        """gid = ctaid.x * ntid.x + tid.x; exit if gid >= N; decode the axes
-        row-major from gid (innermost axis last)."""
-        exts: list[int] = [int(a.extent.value) for a in t.axes]
-        n: int = math.prod(exts)
-        tid, bid, bdim, gid, lane, warp = (self.reg("r") for _ in range(6))
-        self.emit(f"mov.u32 {tid}, %tid.x;", f"mov.u32 {bid}, %ctaid.x;",
-                  f"mov.u32 {bdim}, %ntid.x;", f"mad.lo.s32 {gid}, {bid}, {bdim}, {tid};",
-                  f"and.b32 {lane}, {tid}, 31;", f"shr.u32 {warp}, {tid}, 5;")
-        if self.launch_threads is None or self.launch_threads > n:   # surplus threads
-            p: Reg = self.reg("p")
-            self.emit(f"setp.ge.s32 {p}, {gid}, {n};", f"@{p} bra DONE;")
-        self.idx.update(tid=tid, lane=lane, warp=warp)
-        rest: Reg = gid
-        for axis, ext in reversed(list(zip(t.axes, exts))):
-            if ext == n:                         # the only non-trivial axis
-                self.idx[axis.name] = rest
-                continue
-            a: Reg = self.reg("r")
-            q: Reg = self.reg("r")
-            self.emit(f"rem.s32 {a}, {rest}, {ext};", f"div.s32 {q}, {rest}, {ext};")
-            self.idx[axis.name], rest = a, q
-        self.body(t.body)
-
-    # =========================================================================
-    # Statements: scalar compute
-    # =========================================================================
-    def do_Load(self, s: Stmt) -> None:
-        dsts: list[Reg] = [self.tmp() for _ in s.names]
-        self.load(dsts, s.input, s.index)
-        for name, d in zip(s.names, dsts):
-            self.bind(name, d)
-
-    def do_Assign(self, s: Stmt) -> None:
-        d: Reg = self.tmp()
-        self.op(s.op.name, d, *(self.vals[a] for a in s.args))
-        self.bind(s.name, d)
-
-    def do_Let(self, s: Stmt) -> None:
-        d: Reg = self.tmp()
-        self.emit(f"mov.f32 {d}, {f32_hex(s.value.value)};")
-        self.bind(s.name, d)
-
-    def do_Init(self, s: Stmt) -> None:
-        """Carried state seeded with a literal (matmul accumulator tiles)."""
-        d: Reg = self.tmp()
-        self.emit(f"mov.f32 {d}, {f32_hex(s.identity)};")
-        self.bind(s.name, d)
-        self.inits.add(s.name)
-
-    def do_Write(self, s: Stmt) -> None:
-        self.store(s.output, s.index, [self.vals[v] for v in s.values], s.atomic)
-
-    # =========================================================================
-    # Statements: control flow
-    # =========================================================================
-    def loop(self, axis: str, start: IdxValue, end: IdxValue, step: IdxValue, body: Body) -> None:
-        """for (axis = start; axis < end; axis += step) body"""
-        i: Reg = self.reg("r")
-        p: Reg = self.reg("p")
-        top: str = self.label("LOOP")
-        done: str = self.label("LOOP_END")
-        self.emit(f"mov.s32 {i}, {start};", f"{top}:",
-                  f"setp.ge.s32 {p}, {i}, {end};", f"@{p} bra {done};")
-        self.idx[axis] = i
-        self.body(body)
-        self.emit(f"add.s32 {i}, {i}, {step};", f"bra {top};", f"{done}:")
-
-    def do_StridedLoop(self, s: Stmt) -> None:
-        self.seed_accums(s)
-        end: IdxValue = self.expr(s.end) if s.end is not None else int(s.axis.extent.value)
-        self.loop(s.axis.name, self.expr(s.start), end, self.expr(s.step), s.body)
-
-    def do_Loop(self, s: Stmt) -> None:
-        """for axis in 0..extent. Unrolled when the IR asks and the loop is
-        innermost (matmul's k loop): the axis becomes a Python int and every
-        index constant-folds. Outer loops stay rolled even if marked unroll:
-        attention's key loop wraps four 64-step dot products, and unrolling it
-        exhausts registers."""
-        self.seed_accums(s)
-        n: int = int(s.axis.extent.value)
-        innermost: bool = not any(type(c).__name__ in ("Loop", "StridedLoop") for c in s.body)
-        if s.unroll and innermost and n <= 128:
-            for i in range(n):
-                self.idx[s.axis.name] = i
-                self.body(s.body)
-        else:
-            self.loop(s.axis.name, 0, n, 1, s.body)
-
-    def do_Cond(self, s: Stmt) -> None:
-        c: IdxValue = self.expr(s.cond)
-        if not is_reg(c):                        # constant condition
-            self.body(s.body if c else s.else_body)
-            return
-        end: str = self.label("ENDIF")
-        els: str = self.label("ELSE") if s.else_body else end
-        self.emit(f"@!{self.pred(c)} bra {els};")
-        self.body(s.body)
-        if s.else_body:
-            self.emit(f"bra {end};", f"{els}:")
-            self.body(s.else_body)
-        self.emit(f"{end}:")
-
-    # =========================================================================
-    # Statements: reductions
-    # =========================================================================
-    def accums(self, stmts: Body) -> Iterator[Stmt]:
-        """All Accum statements under `stmts`, recursively."""
-        for s in stmts or ():
-            if type(s).__name__ == "Accum":
-                yield s
-            yield from self.accums(getattr(s, "body", None))
-            yield from self.accums(getattr(s, "else_body", None))
-
-    def seed_accums(self, loop: Stmt) -> None:
-        """A loop with seed=True resets, just before it starts, every accumulator
-        that reduces over its axis. Nested loops therefore restart an inner
-        accumulator on each outer iteration (attention's q.k dot product), while
-        Init-declared carried state (matmul tiles) is never reset."""
-        if not loop.seed:
-            return
-        for s in self.accums(loop.body):
-            if loop.axis.name in s.axes and s.name not in self.inits:
-                if s.name not in self.vals:
-                    self.vals[s.name] = self.tmp()
-                acc: Reg = self.vals[s.name]
-                self.emit(f"mov.f32 {acc}, {f32_hex(IDENTITY[s.op.name])};")
-
-    def do_Accum(self, s: Stmt) -> None:
-        """acc = op(base, value) in place; base defaults to acc itself. The online
-        softmax uses base for the rescaled old sum: acc = acc*alpha + x*beta."""
-        acc: Reg = self.vals[s.name]
-        self.op(s.op.name, acc, self.vals[s.base] if s.base else acc, self.vals[s.value])
-
-    def combine(self, s: Stmt, others: Sequence[Reg]) -> None:
-        """Bind the state_b names to `others`, then run the combine statements."""
-        self.vals.update(zip(s.state_b, others))
-        self.body(s.combine_states)
-
-    def do_WarpShuffle(self, s: Stmt) -> None:
-        """XOR butterfly over `length` lanes: offsets length/2, ..., 1."""
-        off: int = s.length // 2
-        while off >= 1:
-            others: list[Reg] = [self.tmp() for _ in s.state]
-            for st, o in zip(s.state, others):
-                self.emit(f"shfl.sync.bfly.b32 {o}, {self.vals[st]}, {off}, 0x1f, 0xffffffff;")
-            self.combine(s, others)
-            off //= 2
-
-    def do_TreeHalve(self, s: Stmt) -> None:
-        """Shared-memory tree over `length` slots, then broadcast slot 0:
-
-            for (h = length/2; h > 0; h /= 2) {          // unrolled: length is static
-                if (tid < h) { st = buf[tid]; st_b = buf[tid+h]; combine; buf[tid] = st; }
-                barrier
-            }
-            st = buf[0]
-        """
-        if s.inner:
-            raise NotImplementedError("TreeHalve.inner")
-        tid: IdxValue = self.idx[s.tid_var]
-        bar: str = f"bar.sync {s.barrier_id}" + (f", {s.barrier_count}" if s.barrier_count else "") + ";"
-        h: int = s.length // 2
-        while h >= 1:
-            p: Reg = self.reg("p")
-            partner: Reg = self.reg("r")
-            skip: str = self.label("TREE_SKIP")
-            self.emit(f"setp.ge.s32 {p}, {tid}, {h};", f"@{p} bra {skip};",
-                      f"add.s32 {partner}, {tid}, {h};")
-            others: list[Reg] = []
-            for buf, st in zip(s.bufs, s.state):
-                others.append(self.tmp())
-                self.load([self.vals[st]], buf, flat=tid)
-                self.load([others[-1]], buf, flat=partner)
-            if s.tid_var == "warp":
-                # All 32 lanes share one slot, so every lane must load before any
-                # lane stores. Converged warps do this anyway; make it explicit so
-                # it also holds under independent thread scheduling.
-                self.emit("bar.warp.sync -1;")
-            self.combine(s, others)
-            for buf, st in zip(s.bufs, s.state):
-                self.store(buf, None, [self.vals[st]], flat=tid)
-            self.emit(f"{skip}:", bar)
-            h //= 2
-        for buf, st in zip(s.bufs, s.state):     # broadcast the result
-            self.load([self.vals[st]], buf, flat=0)
-
-    # =========================================================================
-    # Statements: shared memory, barriers, async copies
-    # =========================================================================
-    def do_Smem(self, s: Stmt) -> None:
-        """Static `.shared` array, or a slice of the dynamic pool when meta.json
-        sets smem_bytes (needed above the 48 KB static limit, e.g. m01)."""
-        extents: tuple[int, ...] = tuple(int(x) for x in s.extents)
-        align: int = max(int(s.align or 0), 4)
-        self.smem[s.name] = extents
-        base: Reg = self.reg("rd")
-        self.ptr[s.name] = base
-        if self.dynamic_smem:
-            self.smem_offset = -(-self.smem_offset // align) * align   # round up
-            self.emit(f"mov.u64 {base}, smem_pool;",
-                      f"add.u64 {base}, {base}, {self.smem_offset};")
-            self.smem_offset += 4 * math.prod(extents)
-        else:
-            self.globals.append(f".shared .align {align} .f32 {s.name}[{math.prod(extents)}];")
-            self.emit(f"mov.u64 {base}, {s.name};")
-
-    def do_Sync(self, s: Stmt) -> None:
-        if s.warp:
-            self.emit("bar.warp.sync -1;")
-        elif s.count:
-            self.emit(f"bar.sync {s.barrier_id}, {s.count};")
-        else:
-            self.emit(f"bar.sync {s.barrier_id};")
-
-    def do_CpAsyncCopy(self, s: Stmt) -> None:
-        """smem[smem_index + lane_index] <- src[src_index], nbytes at once.
-        Both shared-side indices flatten against the smem extents and add."""
-        if s.swizzle not in (None, "NONE"):
-            raise NotImplementedError("CpAsyncCopy swizzle")
-        flat: IdxValue = self.flat_index(s.smem, s.smem_index)
-        if s.lane_index:
-            lane: IdxValue = self.flat_index(s.smem, s.lane_index)
-            if not is_reg(flat) and not is_reg(lane):
-                flat += lane
-            else:
-                t: Reg = self.reg("r")
-                self.emit(f"add.s32 {t}, {flat}, {lane};")
-                flat = t
-        dbase: Reg
-        doff: int
-        sbase: Reg
-        soff: int
-        _, dbase, doff = self.address(s.smem, flat=flat)
-        _, sbase, soff = self.address(s.src, s.src_index)
-        cache: str = "cg" if s.nbytes == 16 else "ca"   # .cg only supports 16 bytes
-        self.emit(f"cp.async.{cache}.shared.global {mem(dbase, doff)}, {mem(sbase, soff)}, {s.nbytes};")
-
-    def do_CpAsyncCommit(self, s: Stmt) -> None:
-        self.emit("cp.async.commit_group;")
-
-    def do_CpAsyncWait(self, s: Stmt) -> None:
-        self.emit(f"cp.async.wait_group {s.group};")
-
-    # =========================================================================
     # Whole kernel
     # =========================================================================
     def compile(self) -> str:
@@ -672,6 +401,446 @@ class PTXEmitter:
         return "\n".join([PTX_HEADER, *self.globals, "",
                           f".visible .entry {self.kop.name}(", params, ")", "{",
                           *decls, "", *self.lines, "DONE:", "\tret;", "}", ""])
+
+
+# =============================================================================
+# Expressions: one subclass per IR expression kind.
+#   generate() -> Python int (folded), %r register, or %p predicate
+# =============================================================================
+class Expression:
+    kinds: ClassVar[dict[str, type[Expression]]] = {}
+    kind: ClassVar[str]
+
+    def __init_subclass__(cls, kind: Optional[str] = None, **kw: Any) -> None:
+        super().__init_subclass__(**kw)
+        if kind is not None:
+            cls.kind = kind
+            Expression.kinds[kind] = cls
+
+    def __init__(self, em: PTXEmitter, node: Expr) -> None:
+        self.em, self.node = em, node
+
+    @staticmethod
+    def lower(em: PTXEmitter, node: Expr) -> IdxValue:
+        kind: str = type(node).__name__
+        cls: Optional[type[Expression]] = Expression.kinds.get(kind)
+        if cls is None:
+            raise NotImplementedError(
+                f"Kernel IR expression {kind} (add class {kind}Expression(Expression, kind={kind!r}))")
+        return cls(em, node).generate()
+
+    def generate(self) -> IdxValue:
+        raise NotImplementedError
+
+
+class LiteralExpression(Expression, kind="Literal"):
+    def generate(self) -> int:
+        return int(self.node.value)
+
+
+class VarExpression(Expression, kind="Var"):
+    def generate(self) -> IdxValue:
+        return self.em.idx[self.node.name]
+
+
+class TernaryExpression(Expression, kind="TernaryExpr"):
+    """c ? a : b  ->  selp (or folded when c is a constant)."""
+
+    def generate(self) -> IdxValue:
+        e, em = self.node, self.em
+        c: IdxValue = em.expr(e.cond)
+        if not is_reg(c):
+            return em.expr(e.if_true if c else e.if_false)
+        a: IdxValue = em.expr(e.if_true)
+        b: IdxValue = em.expr(e.if_false)
+        d: Reg = em.reg("r")
+        em.emit(f"selp.b32 {d}, {a}, {b}, {em.pred(c)};")
+        return d
+
+
+class BinaryExpression(Expression, kind="BinaryExpr"):
+    def generate(self) -> IdxValue:
+        e, em = self.node, self.em
+        l: IdxValue = em.expr(e.left)
+        r: IdxValue = em.expr(e.right)
+        if not is_reg(l) and not is_reg(r):
+            return FOLD[e.op](l, r)
+        if e.op in CMP_OPS:
+            p: Reg = em.reg("p")
+            em.emit(f"setp.{CMP_OPS[e.op][0]}.s32 {p}, {l}, {r};")
+            return p
+        if e.op in LOGIC_OPS:
+            p = em.reg("p")
+            em.emit(f"{LOGIC_OPS[e.op][0]} {p}, {em.pred(l)}, {em.pred(r)};")
+            return p
+        if (e.op, r) in (("+", 0), ("*", 1)):    # x+0, x*1
+            return l
+        d: Reg = em.reg("r")
+        em.emit(f"{INT_OPS[e.op][0]} {d}, {l}, {r};")
+        return d
+
+class CastExpression(Expression, kind="CastExpr"):
+    """(dtype)expr with C semantics.
+ 
+    Emmy produces two shapes:
+      * (int)idx inside a buffer index, where idx is a value loaded by an
+        earlier Load (gather / embedding lowering). That value sits in an f32
+        register, so the cast is cvt.rzi: truncate toward zero, like C.
+      * (float)x to unify operand types. The result is an f32 register, so it
+        only makes sense where the consumer expects a float, not inside
+        integer index arithmetic.
+ 
+    Integers already in %r and folded constants pass through or fold;
+    predicates become 0 / 1.
+    """
+ 
+    def generate(self) -> IdxValue:
+        raise NotImplementedError("CastExpression not implemented yet")
+
+
+# =============================================================================
+# Statements: one subclass per IR statement kind. generate() emits PTX.
+# =============================================================================
+class Statement:
+    kinds: ClassVar[dict[str, type[Statement]]] = {}
+    kind: ClassVar[str]
+
+    def __init_subclass__(cls, kind: Optional[str] = None, **kw: Any) -> None:
+        super().__init_subclass__(**kw)
+        if kind is not None:
+            cls.kind = kind
+            Statement.kinds[kind] = cls
+
+    def __init__(self, em: PTXEmitter, node: Stmt) -> None:
+        self.em, self.node = em, node
+
+    @staticmethod
+    def lower(em: PTXEmitter, node: Stmt) -> None:
+        kind: str = type(node).__name__
+        cls: Optional[type[Statement]] = Statement.kinds.get(kind)
+        if cls is None:
+            raise NotImplementedError(
+                f"Kernel IR statement {kind} (add class {kind}Statement(Statement, kind={kind!r}))")
+        cls(em, node).generate()
+
+    def generate(self) -> None:
+        raise NotImplementedError
+
+
+# -----------------------------------------------------------------------------
+# Launch
+# -----------------------------------------------------------------------------
+class TileStatement(Statement, kind="Tile"):
+    """gid = ctaid.x * ntid.x + tid.x; exit if gid >= N; decode the axes
+    row-major from gid (innermost axis last)."""
+
+    def generate(self) -> None:
+        t, em = self.node, self.em
+        exts: list[int] = [int(a.extent.value) for a in t.axes]
+        n: int = math.prod(exts)
+        tid, bid, bdim, gid, lane, warp = (em.reg("r") for _ in range(6))
+        em.emit(f"mov.u32 {tid}, %tid.x;", f"mov.u32 {bid}, %ctaid.x;",
+                f"mov.u32 {bdim}, %ntid.x;", f"mad.lo.s32 {gid}, {bid}, {bdim}, {tid};",
+                f"and.b32 {lane}, {tid}, 31;", f"shr.u32 {warp}, {tid}, 5;")
+        if em.launch_threads is None or em.launch_threads > n:   # surplus threads
+            p: Reg = em.reg("p")
+            em.emit(f"setp.ge.s32 {p}, {gid}, {n};", f"@{p} bra DONE;")
+        em.idx.update(tid=tid, lane=lane, warp=warp)
+        rest: Reg = gid
+        for axis, ext in reversed(list(zip(t.axes, exts))):
+            if ext == n:                         # the only non-trivial axis
+                em.idx[axis.name] = rest
+                continue
+            a: Reg = em.reg("r")
+            q: Reg = em.reg("r")
+            em.emit(f"rem.s32 {a}, {rest}, {ext};", f"div.s32 {q}, {rest}, {ext};")
+            em.idx[axis.name], rest = a, q
+        em.body(t.body)
+
+
+# -----------------------------------------------------------------------------
+# Scalar compute
+# -----------------------------------------------------------------------------
+class LoadStatement(Statement, kind="Load"):
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        dsts: list[Reg] = [em.tmp() for _ in s.names]
+        em.load(dsts, s.input, s.index)
+        for name, d in zip(s.names, dsts):
+            em.bind(name, d)
+
+
+class AssignStatement(Statement, kind="Assign"):
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        d: Reg = em.tmp()
+        em.op(s.op.name, d, *(em.vals[a] for a in s.args))
+        em.bind(s.name, d)
+
+
+class LetStatement(Statement, kind="Let"):
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        d: Reg = em.tmp()
+        em.emit(f"mov.f32 {d}, {f32_hex(s.value.value)};")
+        em.bind(s.name, d)
+
+
+class InitStatement(Statement, kind="Init"):
+    """Carried state seeded with a literal (matmul accumulator tiles)."""
+
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        d: Reg = em.tmp()
+        em.emit(f"mov.f32 {d}, {f32_hex(s.identity)};")
+        em.bind(s.name, d)
+        em.inits.add(s.name)
+
+
+class WriteStatement(Statement, kind="Write"):
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        em.store(s.output, s.index, [em.vals[v] for v in s.values], s.atomic)
+
+
+# -----------------------------------------------------------------------------
+# Control flow
+# -----------------------------------------------------------------------------
+def iter_accums(stmts: Body) -> Iterator[Stmt]:
+    """All Accum statements under `stmts`, recursively."""
+    for s in stmts or ():
+        if type(s).__name__ == "Accum":
+            yield s
+        yield from iter_accums(getattr(s, "body", None))
+        yield from iter_accums(getattr(s, "else_body", None))
+
+
+class LoopStatement(Statement):
+    """Shared base for Loop and StridedLoop (not registered itself)."""
+
+    def seed_accums(self) -> None:
+        """A loop with seed=True resets, just before it starts, every accumulator
+        that reduces over its axis. Nested loops therefore restart an inner
+        accumulator on each outer iteration (attention's q.k dot product), while
+        Init-declared carried state (matmul tiles) is never reset."""
+        loop, em = self.node, self.em
+        if not loop.seed:
+            return
+        for s in iter_accums(loop.body):
+            if loop.axis.name in s.axes and s.name not in em.inits:
+                if s.name not in em.vals:
+                    em.vals[s.name] = em.tmp()
+                acc: Reg = em.vals[s.name]
+                em.emit(f"mov.f32 {acc}, {f32_hex(IDENTITY[s.op.name])};")
+
+    def rolled(self, start: IdxValue, end: IdxValue, step: IdxValue) -> None:
+        """for (axis = start; axis < end; axis += step) body"""
+        em = self.em
+        i: Reg = em.reg("r")
+        p: Reg = em.reg("p")
+        top: str = em.label("LOOP")
+        done: str = em.label("LOOP_END")
+        em.emit(f"mov.s32 {i}, {start};", f"{top}:",
+                f"setp.ge.s32 {p}, {i}, {end};", f"@{p} bra {done};")
+        em.idx[self.node.axis.name] = i
+        em.body(self.node.body)
+        em.emit(f"add.s32 {i}, {i}, {step};", f"bra {top};", f"{done}:")
+
+
+class StridedLoopStatement(LoopStatement, kind="StridedLoop"):
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        self.seed_accums()
+        end: IdxValue = em.expr(s.end) if s.end is not None else int(s.axis.extent.value)
+        self.rolled(em.expr(s.start), end, em.expr(s.step))
+
+
+class ForLoopStatement(LoopStatement, kind="Loop"):
+    """for axis in 0..extent. Unrolled when the IR asks and the loop is
+    innermost (matmul's k loop): the axis becomes a Python int and every
+    index constant-folds. Outer loops stay rolled even if marked unroll:
+    attention's key loop wraps four 64-step dot products, and unrolling it
+    exhausts registers."""
+
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        self.seed_accums()
+        n: int = int(s.axis.extent.value)
+        innermost: bool = not any(type(c).__name__ in ("Loop", "StridedLoop") for c in s.body)
+        if s.unroll and innermost and n <= 128:
+            for i in range(n):
+                em.idx[s.axis.name] = i
+                em.body(s.body)
+        else:
+            self.rolled(0, n, 1)
+
+
+class CondStatement(Statement, kind="Cond"):
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        c: IdxValue = em.expr(s.cond)
+        if not is_reg(c):                        # constant condition
+            em.body(s.body if c else s.else_body)
+            return
+        end: str = em.label("ENDIF")
+        els: str = em.label("ELSE") if s.else_body else end
+        em.emit(f"@!{em.pred(c)} bra {els};")
+        em.body(s.body)
+        if s.else_body:
+            em.emit(f"bra {end};", f"{els}:")
+            em.body(s.else_body)
+        em.emit(f"{end}:")
+
+
+# -----------------------------------------------------------------------------
+# Reductions
+# -----------------------------------------------------------------------------
+class AccumStatement(Statement, kind="Accum"):
+    """acc = op(base, value) in place; base defaults to acc itself. The online
+    softmax uses base for the rescaled old sum: acc = acc*alpha + x*beta."""
+
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        acc: Reg = em.vals[s.name]
+        em.op(s.op.name, acc, em.vals[s.base] if s.base else acc, em.vals[s.value])
+
+
+class CombiningStatement(Statement):
+    """Shared base for cross-thread reductions (not registered itself)."""
+
+    def combine(self, others: Sequence[Reg]) -> None:
+        """Bind the state_b names to `others`, then run the combine statements."""
+        s, em = self.node, self.em
+        em.vals.update(zip(s.state_b, others))
+        em.body(s.combine_states)
+
+
+class WarpShuffleStatement(CombiningStatement, kind="WarpShuffle"):
+    """XOR butterfly over `length` lanes: offsets length/2, ..., 1."""
+
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        off: int = s.length // 2
+        while off >= 1:
+            others: list[Reg] = [em.tmp() for _ in s.state]
+            for st, o in zip(s.state, others):
+                em.emit(f"shfl.sync.bfly.b32 {o}, {em.vals[st]}, {off}, 0x1f, 0xffffffff;")
+            self.combine(others)
+            off //= 2
+
+
+class TreeHalveStatement(CombiningStatement, kind="TreeHalve"):
+    """Shared-memory tree over `length` slots, then broadcast slot 0:
+
+        for (h = length/2; h > 0; h /= 2) {          // unrolled: length is static
+            if (tid < h) { st = buf[tid]; st_b = buf[tid+h]; combine; buf[tid] = st; }
+            barrier
+        }
+        st = buf[0]
+    """
+
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        if s.inner:
+            raise NotImplementedError("TreeHalve.inner")
+        tid: IdxValue = em.idx[s.tid_var]
+        bar: str = f"bar.sync {s.barrier_id}" + (f", {s.barrier_count}" if s.barrier_count else "") + ";"
+        h: int = s.length // 2
+        while h >= 1:
+            p: Reg = em.reg("p")
+            partner: Reg = em.reg("r")
+            skip: str = em.label("TREE_SKIP")
+            em.emit(f"setp.ge.s32 {p}, {tid}, {h};", f"@{p} bra {skip};",
+                    f"add.s32 {partner}, {tid}, {h};")
+            others: list[Reg] = []
+            for buf, st in zip(s.bufs, s.state):
+                others.append(em.tmp())
+                em.load([em.vals[st]], buf, flat=tid)
+                em.load([others[-1]], buf, flat=partner)
+            if s.tid_var == "warp":
+                # All 32 lanes share one slot, so every lane must load before any
+                # lane stores. Converged warps do this anyway; make it explicit so
+                # it also holds under independent thread scheduling.
+                em.emit("bar.warp.sync -1;")
+            self.combine(others)
+            for buf, st in zip(s.bufs, s.state):
+                em.store(buf, None, [em.vals[st]], flat=tid)
+            em.emit(f"{skip}:", bar)
+            h //= 2
+        for buf, st in zip(s.bufs, s.state):     # broadcast the result
+            em.load([em.vals[st]], buf, flat=0)
+
+
+# -----------------------------------------------------------------------------
+# Shared memory, barriers, async copies
+# -----------------------------------------------------------------------------
+class SmemStatement(Statement, kind="Smem"):
+    """Static `.shared` array, or a slice of the dynamic pool when meta.json
+    sets smem_bytes (needed above the 48 KB static limit, e.g. m01)."""
+
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        extents: tuple[int, ...] = tuple(int(x) for x in s.extents)
+        align: int = max(int(s.align or 0), 4)
+        em.smem[s.name] = extents
+        base: Reg = em.reg("rd")
+        em.ptr[s.name] = base
+        if em.dynamic_smem:
+            em.smem_offset = -(-em.smem_offset // align) * align   # round up
+            em.emit(f"mov.u64 {base}, smem_pool;",
+                    f"add.u64 {base}, {base}, {em.smem_offset};")
+            em.smem_offset += 4 * math.prod(extents)
+        else:
+            em.globals.append(f".shared .align {align} .f32 {s.name}[{math.prod(extents)}];")
+            em.emit(f"mov.u64 {base}, {s.name};")
+
+
+class SyncStatement(Statement, kind="Sync"):
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        if s.warp:
+            em.emit("bar.warp.sync -1;")
+        elif s.count:
+            em.emit(f"bar.sync {s.barrier_id}, {s.count};")
+        else:
+            em.emit(f"bar.sync {s.barrier_id};")
+
+
+class CpAsyncCopyStatement(Statement, kind="CpAsyncCopy"):
+    """smem[smem_index + lane_index] <- src[src_index], nbytes at once.
+    Both shared-side indices flatten against the smem extents and add."""
+
+    def generate(self) -> None:
+        s, em = self.node, self.em
+        if s.swizzle not in (None, "NONE"):
+            raise NotImplementedError("CpAsyncCopy swizzle")
+        flat: IdxValue = em.flat_index(s.smem, s.smem_index)
+        if s.lane_index:
+            lane: IdxValue = em.flat_index(s.smem, s.lane_index)
+            if not is_reg(flat) and not is_reg(lane):
+                flat += lane
+            else:
+                t: Reg = em.reg("r")
+                em.emit(f"add.s32 {t}, {flat}, {lane};")
+                flat = t
+        dbase: Reg
+        doff: int
+        sbase: Reg
+        soff: int
+        _, dbase, doff = em.address(s.smem, flat=flat)
+        _, sbase, soff = em.address(s.src, s.src_index)
+        cache: str = "cg" if s.nbytes == 16 else "ca"   # .cg only supports 16 bytes
+        em.emit(f"cp.async.{cache}.shared.global {mem(dbase, doff)}, {mem(sbase, soff)}, {s.nbytes};")
+
+
+class CpAsyncCommitStatement(Statement, kind="CpAsyncCommit"):
+    def generate(self) -> None:
+        self.em.emit("cp.async.commit_group;")
+
+
+class CpAsyncWaitStatement(Statement, kind="CpAsyncWait"):
+    def generate(self) -> None:
+        self.em.emit(f"cp.async.wait_group {self.node.group};")
 
 
 # =============================================================================

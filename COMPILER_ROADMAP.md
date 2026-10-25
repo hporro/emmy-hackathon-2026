@@ -12,3 +12,6 @@
 - Now all the tests run and I asked claude to make a little refactor of the code.
 - Added more operations to the F32_OPS list, in order to support more of them (closing the gap between what the IR can express and what the compiler can do).
 - Added typed expressions, in an effort into making the code readable.
+
+### V1.0.1
+- Big refactor: Expressions and statements are classes now.
