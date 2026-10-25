@@ -7,3 +7,8 @@
 ### V0.0.2
 - Asked claude to complete the other phases, while keeping the code as simple as possible. Now it only makes a emmiter class with a static prologue.
 - It passes all tests.
+
+### v1.0.0
+- Now all the tests run and I asked claude to make a little refactor of the code.
+- Added more operations to the F32_OPS list, in order to support more of them (closing the gap between what the IR can express and what the compiler can do).
+- Added typed expressions, in an effort into making the code readable.
