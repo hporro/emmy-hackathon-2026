@@ -16,6 +16,7 @@ problems = sorted(p.name for p in (ROOT / "problems").iterdir() if (p / "meta.js
 problems_extra = sorted(p.name for p in (ROOT / "problems_extra").iterdir() if (p / "meta.json").exists())
 if prefixes:
     problems = [p for p in problems if p.startswith(prefixes)]
+    problems_extra = [p for p in problems_extra if p.startswith(prefixes)]
 
 results = []
 for pid in problems:

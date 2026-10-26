@@ -20,3 +20,6 @@
 - Added some extra problems to test the compiler on, and added an operation to make some tests pass. Updated the run_all.py script in order to run the extra tests.
 - Figured out that in order to make the tests that are not passing pass, we have to support f16 types.
 - Figured out that integer types are not correctly handled.
+
+### V1.1.0
+- Added more types support (f16, f32, f64, u8, i8, u16, i16, u32, i32, u64, i64), and that makes all the tests pass. This is done trough a new class adition, the DType class. Every Val has a DType now, so every value carries their type. The compiler later uses that to figure out which operations are the ones better fit to be used.
