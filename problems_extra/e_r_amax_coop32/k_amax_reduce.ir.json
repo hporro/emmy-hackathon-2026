@@ -1,0 +1,49 @@
+{
+  "inputs": [
+    "x"
+  ],
+  "outputs": [
+    "amax"
+  ],
+  "nodes": {
+    "x": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            1024
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "amax": {
+      "op": "KernelOp",
+      "op_fields": {
+        "body": [
+          "Tile(axes=(Axis(name='a0', extent=Dim(4), window=None), Axis(name='a1_co', extent=Dim(32), window=None)), body=(StridedLoop(axis=Axis(name='a1', extent=Dim(1024), window=None), start=Var(name='a1_co'), step=Literal(value=32, dtype='int'), body=(Load(names=('in0',), input='x', index=(Var(name='a0'), Var(name='a1')), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Accum(name='acc0', value='in0', op=ElementwiseImpl('maximum'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=('a1',), base=None)), unroll=False, end=None, seed=True), WarpShuffle(state=('acc0',), state_b=('acc0__o',), combine_states=(Assign(name='acc0', op=ElementwiseImpl('maximum'), args=('acc0', 'acc0__o'), dtype=None),), length=32, dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Cond(cond=BinaryExpr(op='==', left=Var(name='a1_co'), right=Literal(value=0, dtype='int')), body=(Write(output='amax', index=(Var(name='a0'), Literal(value=0, dtype='int')), values=('acc0',), value_dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), atomic=False, swizzle='NONE'),), else_body=())), block_threads=32, aux_threads=0, raster_axes=None, raster_group=None, raster_orient='m')"
+        ],
+        "name": "k_amax_reduce",
+        "zero_delegated": [],
+        "serial": []
+      },
+      "inputs": [
+        "x"
+      ],
+      "outputs": [
+        {
+          "name": "amax",
+          "shape": [
+            4,
+            1
+          ],
+          "dtype": "f32"
+        }
+      ]
+    }
+  }
+}

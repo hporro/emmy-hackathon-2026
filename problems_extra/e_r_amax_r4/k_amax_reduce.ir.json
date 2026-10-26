@@ -1,0 +1,49 @@
+{
+  "inputs": [
+    "x"
+  ],
+  "outputs": [
+    "amax"
+  ],
+  "nodes": {
+    "x": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            1024
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "amax": {
+      "op": "KernelOp",
+      "op_fields": {
+        "body": [
+          "Tile(axes=(Axis(name='a0', extent=Dim(4), window=None),), body=(StridedLoop(axis=Axis(name='a1', extent=Dim(1024), window=None), start=Literal(value=0, dtype='int'), step=Literal(value=4, dtype='int'), body=(Load(names=('in0',), input='x', index=(Var(name='a0'), Var(name='a1')), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Accum(name='acc0', value='in0', op=ElementwiseImpl('maximum'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=('a1',), base=None), Load(names=('in0__r1',), input='x', index=(Var(name='a0'), BinaryExpr(op='+', left=Var(name='a1'), right=Literal(value=1, dtype='int'))), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Accum(name='acc0__r1', value='in0__r1', op=ElementwiseImpl('maximum'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=('a1',), base=None), Load(names=('in0__r2',), input='x', index=(Var(name='a0'), BinaryExpr(op='+', left=Var(name='a1'), right=Literal(value=2, dtype='int'))), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Accum(name='acc0__r2', value='in0__r2', op=ElementwiseImpl('maximum'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=('a1',), base=None), Load(names=('in0__r3',), input='x', index=(Var(name='a0'), BinaryExpr(op='+', left=Var(name='a1'), right=Literal(value=3, dtype='int'))), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Accum(name='acc0__r3', value='in0__r3', op=ElementwiseImpl('maximum'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=('a1',), base=None)), unroll=False, end=None, seed=True), Accum(name='acc0', value='acc0__r1', op=ElementwiseImpl('maximum'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=(), base=None), Accum(name='acc0', value='acc0__r2', op=ElementwiseImpl('maximum'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=(), base=None), Accum(name='acc0', value='acc0__r3', op=ElementwiseImpl('maximum'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=(), base=None), Write(output='amax', index=(Var(name='a0'), Literal(value=0, dtype='int')), values=('acc0',), value_dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), atomic=False, swizzle='NONE')), block_threads=None, aux_threads=0, raster_axes=None, raster_group=None, raster_orient='m')"
+        ],
+        "name": "k_amax_reduce",
+        "zero_delegated": [],
+        "serial": []
+      },
+      "inputs": [
+        "x"
+      ],
+      "outputs": [
+        {
+          "name": "amax",
+          "shape": [
+            4,
+            1
+          ],
+          "dtype": "f32"
+        }
+      ]
+    }
+  }
+}

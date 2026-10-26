@@ -15,3 +15,8 @@
 
 ### V1.0.1
 - Big refactor: Expressions and statements are classes now.
+
+### V1.0.2
+- Added some extra problems to test the compiler on, and added an operation to make some tests pass. Updated the run_all.py script in order to run the extra tests.
+- Figured out that in order to make the tests that are not passing pass, we have to support f16 types.
+- Figured out that integer types are not correctly handled.

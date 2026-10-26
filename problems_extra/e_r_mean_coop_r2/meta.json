@@ -1,0 +1,66 @@
+{
+ "id": "e_r_mean_coop_r2",
+ "code": "torch.randn(4, 1024).mean(-1, keepdim=True)",
+ "rtol": 0.0001,
+ "atol": 0.0001,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "mean"
+ ],
+ "kernels": [
+  {
+   "node": "mean",
+   "entry": "k_mean_6e1b56",
+   "arg_order": [
+    "mean_count",
+    "x",
+    "mean"
+   ],
+   "grid": [
+    4,
+    1,
+    1
+   ],
+   "block": [
+    32,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "mean_count",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      1024.0
+     ]
+    },
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      4,
+      1024
+     ],
+     "seed": 0
+    },
+    {
+     "name": "mean",
+     "dtype": "f32",
+     "shape": [
+      4,
+      1
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

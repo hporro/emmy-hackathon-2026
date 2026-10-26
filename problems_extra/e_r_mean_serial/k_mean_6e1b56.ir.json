@@ -1,0 +1,74 @@
+{
+  "inputs": [
+    "x"
+  ],
+  "outputs": [
+    "mean"
+  ],
+  "nodes": {
+    "mean_count": {
+      "op": "ConstantOp",
+      "op_fields": {
+        "name": "mean_count",
+        "value": 1024.0,
+        "context_value": null,
+        "load_ops": [],
+        "source_path": null,
+        "source_parts": [],
+        "source_shape": null,
+        "source_dtype": null,
+        "source_graph": null
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "mean_count",
+          "shape": [
+            1
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "x": {
+      "op": "InputOp",
+      "op_fields": {},
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "x",
+          "shape": [
+            4,
+            1024
+          ],
+          "dtype": "f32"
+        }
+      ]
+    },
+    "mean": {
+      "op": "KernelOp",
+      "op_fields": {
+        "body": [
+          "Tile(axes=(Axis(name='a0', extent=Dim(4), window=None),), body=(Loop(axis=Axis(name='a1', extent=Dim(1024), window=None), body=(Load(names=('in1',), input='x', index=(Var(name='a0'), Var(name='a1')), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Accum(name='acc0', value='in1', op=ElementwiseImpl('add'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), axes=('a1',), base=None)), unroll=False, seed=True), Load(names=('in0',), input='mean_count', index=(Literal(value=0, dtype='int'),), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Assign(name='v0', op=ElementwiseImpl('reciprocal'), args=('in0',), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Assign(name='v1', op=ElementwiseImpl('multiply'), args=('acc0', 'v0'), dtype=DataType(name='f32', np=dtype('float32'), nbytes=4)), Write(output='mean', index=(Var(name='a0'), Literal(value=0, dtype='int')), values=('v1',), value_dtype=DataType(name='f32', np=dtype('float32'), nbytes=4), atomic=False, swizzle='NONE')), block_threads=None, aux_threads=0, raster_axes=None, raster_group=None, raster_orient='m')"
+        ],
+        "name": "k_mean_6e1b56",
+        "zero_delegated": [],
+        "serial": []
+      },
+      "inputs": [
+        "mean_count",
+        "x"
+      ],
+      "outputs": [
+        {
+          "name": "mean",
+          "shape": [
+            4,
+            1
+          ],
+          "dtype": "f32"
+        }
+      ]
+    }
+  }
+}

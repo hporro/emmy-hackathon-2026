@@ -1,0 +1,7 @@
+    Tile[a0, a1_co] (N=128)
+        for a1 in a1_co..1024:32
+            in0 = load x[a0, a1]
+            f32 acc0 <- maximum(acc0, in0)
+        WarpShuffle(acc0, length=32)
+        if ((a1_co == 0)):
+            amax[a0, 0] = acc0

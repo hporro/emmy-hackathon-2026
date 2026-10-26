@@ -1,0 +1,14 @@
+    Tile[a0] (N=4)
+        for a1 in 0..1024:4
+            in0 = load x[a0, a1]
+            f32 acc0 <- maximum(acc0, in0)
+            in0__r1 = load x[a0, (a1 + 1)]
+            f32 acc0__r1 <- maximum(acc0__r1, in0__r1)
+            in0__r2 = load x[a0, (a1 + 2)]
+            f32 acc0__r2 <- maximum(acc0__r2, in0__r2)
+            in0__r3 = load x[a0, (a1 + 3)]
+            f32 acc0__r3 <- maximum(acc0__r3, in0__r3)
+        f32 acc0 <- maximum(acc0, acc0__r1)
+        f32 acc0 <- maximum(acc0, acc0__r2)
+        f32 acc0 <- maximum(acc0, acc0__r3)
+        amax[a0, 0] = acc0

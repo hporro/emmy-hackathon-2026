@@ -1,6 +1,7 @@
 {
     "version": "0.2.0",
     "configurations": [
+        
         {
             "name": "Python: Debug with argument",
             "type": "debugpy",
@@ -8,7 +9,7 @@
             "program": "${workspaceFolder}/compile.py",
             "console": "integratedTerminal",
             "args": [
-                "${workspaceFolder}/problems/p00_scalar_add/k_add_pointwise.ir.json"
+                "${workspaceFolder}/problems_extra/e_f_rmsnorm_pow/k_mean_191359.ir.json"
             ]
         }
     ]

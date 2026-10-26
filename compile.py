@@ -190,12 +190,13 @@ IDENTITY: dict[str, float] = {"add": 0.0, "multiply": 1.0, "maximum": -1e30, "mi
 # =============================================================================
 # Integer index arithmetic. op -> (PTX instruction, Python constant fold)
 # =============================================================================
+# TODO: This doesn't account for signed or unsigend ints, we're handling just 1 type of integer (unsigned), and very badly
 INT_OPS: dict[str, tuple[str, Callable[[int, int], int]]] = {
     "+": ("add.s32", operator.add),      "-": ("sub.s32", operator.sub),
     "*": ("mul.lo.s32", operator.mul),   "/": ("div.u32", operator.floordiv),
     "%": ("rem.u32", operator.mod),      "&": ("and.b32", operator.and_),
     "|": ("or.b32", operator.or_),       "<<": ("shl.b32", operator.lshift),
-    ">>": ("shr.s32", operator.rshift),
+    ">>": ("shr.s32", operator.rshift),  "//": ("div.u32", operator.floordiv),
 }
 CMP_OPS: dict[str, tuple[str, Callable[[int, int], bool]]] = {   # -> setp.<cmp>.s32
     "==": ("eq", operator.eq), "!=": ("ne", operator.ne),

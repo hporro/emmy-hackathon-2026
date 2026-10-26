@@ -1,0 +1,55 @@
+{
+ "id": "e_f_l2_serial",
+ "code": "torch.sqrt((lambda t: (t * t).sum(dim=1, keepdim=True))(torch.randn(4, 1024)))",
+ "rtol": 0.0001,
+ "atol": 0.0001,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "sqrt"
+ ],
+ "kernels": [
+  {
+   "node": "sqrt",
+   "entry": "k_sqrt_reduce",
+   "arg_order": [
+    "x",
+    "sqrt"
+   ],
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      4,
+      1024
+     ],
+     "seed": 0
+    },
+    {
+     "name": "sqrt",
+     "dtype": "f32",
+     "shape": [
+      4,
+      1
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

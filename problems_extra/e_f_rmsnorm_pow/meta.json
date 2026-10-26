@@ -1,0 +1,79 @@
+{
+ "id": "e_f_rmsnorm_pow",
+ "code": "x = torch.randn(2,64,256); torch.mul(x, torch.pow(torch.mean(torch.pow(x,2),-1,keepdim=True)+1e-6, -0.5))",
+ "rtol": 0.001,
+ "atol": 0.0001,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "mul"
+ ],
+ "kernels": [
+  {
+   "node": "mul",
+   "entry": "k_mean_191359",
+   "arg_order": [
+    "mean_count",
+    "add_c1",
+    "x",
+    "mul"
+   ],
+   "grid": [
+    128,
+    1,
+    1
+   ],
+   "block": [
+    128,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "mean_count",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      256.0
+     ]
+    },
+    {
+     "name": "add_c1",
+     "dtype": "f32",
+     "shape": [
+      1
+     ],
+     "data": [
+      1e-06
+     ]
+    },
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      2,
+      64,
+      256
+     ],
+     "seed": 0
+    },
+    {
+     "name": "mul",
+     "dtype": "f32",
+     "shape": [
+      2,
+      64,
+      256
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}

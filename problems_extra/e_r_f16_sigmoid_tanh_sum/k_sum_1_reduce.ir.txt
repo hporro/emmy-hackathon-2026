@@ -1,0 +1,16 @@
+    Tile[a0, a1_co] (N=512)
+        for a1 in a1_co..64:128
+            in0 = load x[a0, a1]
+            f16 v0 = sigmoid(in0)
+            f16 v1 = tanh(in0)
+            f16 v2 = multiply(v0, v1)
+            f32 acc0 <- add(acc0, v2)
+        WarpShuffle(acc0, length=32)
+        Smem float acc0_smem[4]
+        if ((lane == 0)):
+            acc0_smem[warp] = acc0
+        Sync
+        TreeHalve(acc0, length=4, tid=warp)
+        if ((a1_co == 0)):
+            f16 v3 = copy(acc0)
+            sum_1[a0] = v3

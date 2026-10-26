@@ -1,0 +1,55 @@
+{
+ "id": "e_p03_relu_2d",
+ "code": "torch.relu(torch.randn(16,32))",
+ "rtol": 0,
+ "atol": 0,
+ "graph_inputs": [
+  "x"
+ ],
+ "graph_outputs": [
+  "relu"
+ ],
+ "kernels": [
+  {
+   "node": "relu",
+   "entry": "k_relu_pointwise",
+   "arg_order": [
+    "x",
+    "relu"
+   ],
+   "grid": [
+    1,
+    1,
+    1
+   ],
+   "block": [
+    256,
+    1,
+    1
+   ],
+   "smem_bytes": 0,
+   "zero_outputs": [],
+   "args": [
+    {
+     "name": "x",
+     "dtype": "f32",
+     "shape": [
+      16,
+      32
+     ],
+     "seed": 0
+    },
+    {
+     "name": "relu",
+     "dtype": "f32",
+     "shape": [
+      16,
+      32
+     ],
+     "output": true
+    }
+   ],
+   "final": true
+  }
+ ]
+}
