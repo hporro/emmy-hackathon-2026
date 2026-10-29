@@ -39,7 +39,9 @@ for pid in problems_extra:
     detail = next((l for l in out if "PASS" in l), "") if ok else (out[0] if out else "no output")
     results.append((pid, ok))
     print(f"{'PASS' if ok else 'FAIL'}  {pid:<18} {detail[:90]}")
-
+    if not ok: 
+        print(f"python problems_extra/{pid} --compiler compile.py")
+    
 print()
 for letter, cat in CATEGORIES.items():
     rs = [ok for pid, ok in results if pid.startswith(letter)]

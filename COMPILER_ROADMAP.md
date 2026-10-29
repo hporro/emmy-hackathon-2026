@@ -23,3 +23,8 @@
 
 ### V1.1.0
 - Added more types support (f16, f32, f64, u8, i8, u16, i16, u32, i32, u64, i64), and that makes all the tests pass. This is done trough a new class adition, the DType class. Every Val has a DType now, so every value carries their type. The compiler later uses that to figure out which operations are the ones better fit to be used.
+
+### V2.0.0
+- Added a IR analyzer that improves thread mapping in the loop operations. It changes thread mapping strategies in order to use the biggest possible load operations (*ld.global.v4*).
+- Found out that the IR made from the pytorch code marked as serial are way slower, because they use few threads. It seems to have something to do with the "sequential label". No time to dig deeper on that tough.
+

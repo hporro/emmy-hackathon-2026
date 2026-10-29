@@ -43,11 +43,17 @@ import math
 import operator
 import struct
 import sys
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple, Optional, Sequence, Union
 
 from emmy.compiler.graph import Graph
 from emmy.compiler.ir.kernel.ir import KernelOp
+from emmy.compiler.dim import Dim
+from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
+from emmy.compiler.ir.stmt.body import free_names
+from emmy.compiler.ir.stmt.leaves import Assign
+
 
 PTX_HEADER = ".version 8.0\n.target sm_89\n.address_size 64\n"
 
@@ -1106,6 +1112,414 @@ class CpAsyncWaitStatement(Statement, kind="CpAsyncWait"):
 
 
 # =============================================================================
+# IR optimizer (Kernel IR -> Kernel IR), run by main() before the emitter.
+#
+# It targets reduction loops: a Loop / StridedLoop whose body is
+# Load -> pointwise ops -> Accum. A loop like
+#
+#     for (a = t; a < N; a += S)  { x = buf[.., a];  acc = op(acc, f(x)); }
+#
+# is rewritten, with vector width V, unroll factor U and A partial
+# accumulators, into
+#
+#     for (g = t; g < N/V; g += S*U) {      // g counts groups of V elements
+#         load the U groups of this iteration (V-wide when `a` is contiguous)
+#         U*V copies of f; copy c accumulates into acc__p{c % A}
+#     }
+#     acc = op(op(acc__p0, acc__p1), ...)   // combine the partials
+#
+# analyze() decides whether that is legal and picks V, U and A.
+# rewrite() applies the decision. The launch geometry never changes.
+# Set EMMY_NO_OPT=1 to turn the pass off.
+# =============================================================================
+
+MAX_VEC_ELEMS = 4            # widest vector load: ld.v4
+MAX_VEC_BYTES = 16           # ...and at most 128 bits
+UNROLL_CHOICES = (8, 4, 2)   # tried largest first
+MAX_BYTES_IN_FLIGHT = 256    # loaded per thread per iteration
+MAX_BODY_STMTS = 512         # cap on the unrolled body size
+MAX_ACCUMULATORS = 8         # more independent chains stop helping
+REDUCE_OPS = {"add", "multiply", "maximum", "minimum"}   # ops IDENTITY can seed
+LOOP_BODY_KINDS = {"Load", "Assign", "Let", "Accum"}
+
+
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+def kind(s: Any) -> str:
+    return type(s).__name__
+
+
+def lit(c: int) -> Literal:
+    return Literal(c, "int")
+
+
+def int_value(e: Any) -> Optional[int]:
+    """The value of an integer Literal, else None."""
+    if kind(e) == "Literal" and not isinstance(e.value, bool):
+        return int(e.value)
+    return None
+
+
+def mul(e: Any, c: int) -> Any:
+    return e if c == 1 else BinaryExpr("*", e, lit(c))
+
+
+def add(e: Any, c: int) -> Any:
+    return e if c == 0 else BinaryExpr("+", e, lit(c))
+
+
+def static_extent(axis: Any) -> Optional[int]:
+    try:
+        return int(axis.extent.value)
+    except Exception:                         # symbolic extent
+        return None
+
+
+def children(s: Any) -> list:
+    """The statement bodies nested directly inside s."""
+    return [b for b in (getattr(s, "body", None), getattr(s, "else_body", None)) if b]
+
+
+def walk(stmts: Any):
+    for s in stmts or ():
+        yield s
+        for b in children(s):
+            yield from walk(b)
+
+
+def contains(s: Any, target: Any) -> bool:
+    return s is target or any(contains(c, target) for b in children(s) for c in b)
+
+
+# -----------------------------------------------------------------------------
+# What the analyzer knows about the whole kernel
+# -----------------------------------------------------------------------------
+@dataclass
+class KernelInfo:
+    graph: Any
+    inits: set    # Init-declared names: carried state, never split
+    smem: set     # shared-memory buffers: never vector-loaded
+    names: set    # every name in use, so new names don't collide
+
+    @classmethod
+    def of(cls, graph: Any, kop: Any) -> "KernelInfo":
+        info = cls(graph, set(), set(), set(graph.nodes))
+        for s in walk(kop.body):
+            k = kind(s)
+            if k == "Init":
+                info.inits.add(s.name)
+            if k == "Smem":
+                info.smem.add(s.name)
+            if k in ("Smem", "Init", "Accum"):
+                info.names.add(s.name)
+            info.names.update(s.defines())    # not s.name: it asserts on vector Loads
+            if hasattr(s, "axis"):
+                info.names.add(s.axis.name)
+            for a in getattr(s, "axes", ()) or ():
+                info.names.add(getattr(a, "name", a))
+        return info
+
+    def fresh(self, base: str) -> str:
+        name, n = base, 0
+        while name in self.names:
+            n += 1
+            name = f"{base}_{n}"
+        self.names.add(name)
+        return name
+
+    def nbytes(self, buf: str) -> int:
+        node = self.graph.nodes.get(buf)
+        return int(node.outputs[0].dtype.nbytes) if node else 4
+
+    def last_dim(self, buf: str) -> Optional[int]:
+        """Size of buf's contiguous dimension, or None if buf can't be vector-loaded."""
+        node = self.graph.nodes.get(buf)
+        if buf in self.smem or node is None or node.outputs[0].dtype.name == "bool":
+            return None
+        shape = node.outputs[0].shape
+        return int(shape[-1].value) if len(shape) else 1
+
+
+# -----------------------------------------------------------------------------
+# Analyzer
+# -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class LoopPlan:
+    vec: int                   # V: elements per group (1 = no vector loads)
+    unroll: int                # U: groups per iteration
+    n_acc: int                 # A: partial accumulators per Accum
+    vector_loads: frozenset    # body positions of the Loads done V-wide
+    elems: int                 # N: extent of the reduced axis
+    step: int                  # S: thread stride (1 for Loop)
+    strided: bool
+
+
+def analyze(loop: Any, info: KernelInfo, after: Sequence, thread_axes: dict,
+            enclosing: Sequence) -> Optional[LoopPlan]:
+    """The plan for rewriting `loop`, or None to leave it alone.
+
+    after        statements that run after the loop
+    thread_axes  Tile axes in scope: name -> extent
+    enclosing    bodies of the loops around this one
+    """
+    N = static_extent(loop.axis)
+    space = iteration_space(loop, thread_axes)
+    if N is None or space is None:
+        return None
+    S, first_start, last_start = space
+    strided = kind(loop) == "StridedLoop"
+
+    if not is_plain_reduction(loop, info):
+        return None
+    if not body_values_die_with_loop(loop, after, enclosing):
+        return None
+    if strided and N < S:      # more threads than elements: the Tile shape is the issue
+        return None
+
+    # Vector loads change which elements a thread owns, so the threads must
+    # partition [0, S) exactly. Unrolling only needs every thread to start below S.
+    covers_exactly = (first_start, last_start) == (0, S - 1)
+    V, vector_loads = choose_vector_width(loop, info, N, covers_exactly)
+    U = choose_unroll(loop, info, N // V, V, S, strided, last_start < S)
+    if V * U == 1:
+        return None
+    return LoopPlan(V, U, min(V * U, MAX_ACCUMULATORS), vector_loads, N, S, strided)
+
+
+def iteration_space(loop: Any, thread_axes: dict) -> Optional[tuple]:
+    """(step, smallest start, largest start) over all threads, or None if unknown."""
+    if kind(loop) == "Loop":
+        return 1, 0, 0
+    step = int_value(loop.step)
+    if step is None or step <= 0:
+        return None
+    if loop.end is not None and int_value(loop.end) != static_extent(loop.axis):
+        return None
+    start = loop.start
+    if int_value(start) is not None:
+        return step, int_value(start), int_value(start)
+    if kind(start) == "Var" and start.name in thread_axes:
+        return step, 0, thread_axes[start.name] - 1
+    return None
+
+
+def is_plain_reduction(loop: Any, info: KernelInfo) -> bool:
+    """Straight-line Load -> pointwise -> Accum body, where every Accum is a
+    reorderable reduction over this loop and nothing else reads it."""
+    body, axis = list(loop.body), loop.axis.name
+    if not loop.seed or any(kind(s) not in LOOP_BODY_KINDS for s in body):
+        return False
+
+    accums = [s for s in body if kind(s) == "Accum"]
+    acc_names = {a.name for a in accums}
+    if not accums or len(acc_names) < len(accums):
+        return False
+    for a in accums:
+        if (a.base is not None                        # online-softmax style recurrence
+                or a.op.name not in REDUCE_OPS
+                or not (a.op.associative and a.op.commutative)
+                or a.name in info.inits
+                or axis not in a.axes):
+            return False
+
+    defined = [n for s in body if kind(s) != "Accum" for n in s.defines()]
+    if len(set(defined)) < len(defined) or set(defined) & acc_names:
+        return False                                  # a name is rebound in the loop
+    for s in body:
+        if set(s.deps()) & acc_names:                 # an accumulator is read in the loop
+            return False
+        if kind(s) == "Assign" and axis in s.args:    # loop index used as a value
+            return False
+        if kind(s) == "Load" and any(e.free_vars() & set(defined) for e in s.index):
+            return False                              # gather through a computed index
+    return True
+
+
+def body_values_die_with_loop(loop: Any, after: Sequence, enclosing: Sequence) -> bool:
+    """The rewrite renames every value the body defines, so none may be read
+    after the loop, or before it by the next iteration of an enclosing loop."""
+    local = {n for s in loop.body if kind(s) != "Accum" for n in s.defines()}
+    live = set(local)
+    for s in after:
+        if free_names(s) & live:
+            return False
+        live -= set(s.defines())
+    return not any(free_names(s) & local
+                   for body in enclosing for s in body if not contains(s, loop))
+
+
+def choose_vector_width(loop: Any, info: KernelInfo, N: int, covers_exactly: bool) -> tuple:
+    """(V, positions of the Loads that become V-wide). V = 1 when nothing qualifies."""
+    if not covers_exactly:
+        return 1, frozenset()
+    axis = loop.axis.name
+
+    def fits(s: Any, v: int) -> bool:
+        """s reads `axis` as its contiguous dimension, and a v-wide load stays aligned."""
+        if len(s.names) != 1 or not s.index:
+            return False
+        last = s.index[-1]
+        if kind(last) != "Var" or last.name != axis:
+            return False
+        if any(axis in e.free_vars() for e in s.index[:-1]):
+            return False
+        dim = info.last_dim(s.input)
+        return dim is not None and dim % v == 0 and v * info.nbytes(s.input) <= MAX_VEC_BYTES
+
+    for v in (4, 2):
+        if v > MAX_VEC_ELEMS or N % v:
+            continue
+        wide = frozenset(i for i, s in enumerate(loop.body) if kind(s) == "Load" and fits(s, v))
+        if wide:
+            return v, wide
+    return 1, frozenset()
+
+
+def choose_unroll(loop: Any, info: KernelInfo, groups: int, V: int, S: int,
+                  strided: bool, starts_below_step: bool) -> int:
+    """The largest U that divides every thread's trip count and stays within
+    the bytes-in-flight and body-size budgets."""
+    body = list(loop.body)
+    bytes_per_copy = sum(V * info.nbytes(s.input) * len(s.names)
+                         for s in body if kind(s) == "Load")
+    for u in UNROLL_CHOICES:
+        if strided:
+            divides = starts_below_step and groups % (S * u) == 0
+        else:
+            divides = groups % u == 0
+        within_budget = (u * bytes_per_copy <= MAX_BYTES_IN_FLIGHT
+                         and u * V * len(body) <= MAX_BODY_STMTS)
+        if divides and within_budget:
+            return u
+    return 1
+
+
+# -----------------------------------------------------------------------------
+# Rewriter
+# -----------------------------------------------------------------------------
+def rewrite(loop: Any, plan: LoopPlan, info: KernelInfo) -> list:
+    """[new loop, combine statements...] that replace `loop`."""
+    V, U, A, S = plan.vec, plan.unroll, plan.n_acc, plan.step
+    axis, body = loop.axis.name, list(loop.body)
+    groups = plan.elems // V
+
+    # The new loop counts groups. Copy k of iteration i handles group
+    #   i + k*S   (StridedLoop: threads interleave)   or
+    #   i*U + k   (Loop: one thread does every group)
+    # and element j of that group is group*V + j.
+    i = Var(info.fresh(f"{axis}_v{V}u{U}"))
+    if plan.strided:
+        new_axis = replace(loop.axis, name=i.name, extent=Dim(groups))
+        element = lambda k, j: add(mul(i, V), k * S * V + j)
+    else:
+        new_axis = replace(loop.axis, name=i.name, extent=Dim(groups // U))
+        element = lambda k, j: add(mul(i, U * V), k * V + j)
+
+    # Every value the body defines gets one name per copy (k, j).
+    defined = sorted({n for s in body if kind(s) != "Accum" for n in s.defines()})
+    copy_name = {(n, k, j): info.fresh(f"{n}__u{k}v{j}")
+                 for n in defined for k in range(U) for j in range(V)}
+    accums = [s for s in body if kind(s) == "Accum"]
+    partial = {(a.name, c): info.fresh(f"{a.name}__p{c}") for a in accums for c in range(A)}
+
+    def rn(name: str, k: int, j: int) -> str:
+        return copy_name.get((name, k, j), name)
+
+    # All loads first, so every load of the iteration is in flight together.
+    loads = []
+    for k in range(U):
+        for pos, s in enumerate(body):
+            if kind(s) != "Load":
+                continue
+            if pos in plan.vector_loads:          # one V-wide load
+                loads.append(replace(
+                    s, names=tuple(rn(s.names[0], k, j) for j in range(V)),
+                    index=(*s.index[:-1], element(k, 0))))
+            else:                                 # V scalar loads
+                for j in range(V):
+                    loads.append(replace(
+                        s, names=tuple(rn(n, k, j) for n in s.names),
+                        index=tuple(e.substitute({axis: element(k, j)}) for e in s.index)))
+
+    # Then the compute, one copy per element; copy c feeds partial c % A.
+    compute = []
+    for k in range(U):
+        for j in range(V):
+            c = k * V + j
+            for s in body:
+                if kind(s) == "Let":
+                    renames = {n: Var(rn(n, k, j)) for n in defined}
+                    compute.append(replace(s, name=rn(s.name, k, j), value=s.value.substitute(
+                        {axis: element(k, j), **renames})))
+                elif kind(s) == "Assign":
+                    compute.append(replace(s, name=rn(s.name, k, j),
+                                           args=tuple(rn(a, k, j) for a in s.args)))
+                elif kind(s) == "Accum":
+                    compute.append(replace(
+                        s, name=partial[(s.name, c % A)], value=rn(s.value, k, j),
+                        axes=tuple(i.name if a == axis else a for a in s.axes)))
+
+    if plan.strided:
+        new_loop = replace(loop, axis=new_axis, step=lit(S * U), end=None,
+                           body=(*loads, *compute))
+    else:
+        new_loop = replace(loop, axis=new_axis, body=(*loads, *compute))
+
+    combine = []
+    for a in accums:
+        combine += combine_partials(a, [partial[(a.name, c)] for c in range(A)], info)
+    return [new_loop, *combine]
+
+
+def combine_partials(acc: Any, parts: list, info: KernelInfo) -> list:
+    """Pairwise tree of Assigns folding `parts` into acc.name."""
+    stmts = []
+    while len(parts) > 1:
+        merged = []
+        for x, y in zip(parts[0::2], parts[1::2]):
+            out = acc.name if len(parts) == 2 else info.fresh(f"{acc.name}__t")
+            stmts.append(Assign(name=out, op=acc.op, args=(x, y), dtype=acc.dtype))
+            merged.append(out)
+        if len(parts) % 2:
+            merged.append(parts[-1])
+        parts = merged
+    return stmts
+
+
+# -----------------------------------------------------------------------------
+# Pass driver
+# -----------------------------------------------------------------------------
+def optimize(graph: Any, kop: Any) -> Any:
+    """kop with every rewritable reduction loop rewritten."""
+    info = KernelInfo.of(graph, kop)
+
+    def visit(stmts: Sequence, after: tuple, thread_axes: dict, enclosing: tuple) -> tuple:
+        stmts, out = tuple(stmts or ()), []
+        for n, s in enumerate(stmts):
+            rest = stmts[n + 1:] + after
+            k = kind(s)
+            if k == "Tile":
+                axes = {a.name: static_extent(a) for a in s.axes}
+                out.append(replace(s, body=visit(s.body, rest, axes, enclosing)))
+            elif k in ("Loop", "StridedLoop"):
+                plan = analyze(s, info, rest, thread_axes, enclosing)
+                if plan:
+                    out += rewrite(s, plan, info)
+                else:
+                    out.append(replace(s, body=visit(s.body, rest, thread_axes,
+                                                     enclosing + (s.body,))))
+            elif k == "Cond":
+                out.append(replace(s, body=visit(s.body, rest, thread_axes, enclosing),
+                                   else_body=visit(s.else_body, rest, thread_axes, enclosing)))
+            else:
+                out.append(s)
+        return tuple(out)
+
+    return replace(kop, body=visit(kop.body, (), {}, ()))
+
+
+# =============================================================================
 # Driver
 # =============================================================================
 def launch_info(ir_path: Path, entry: str) -> tuple[Optional[list[str]], Optional[int], int]:
@@ -1125,7 +1539,10 @@ def main(path: Union[str, Path]) -> None:
     node = next(n for n in graph.nodes.values() if isinstance(n.op, KernelOp))
     arg_order, threads, smem_bytes = launch_info(path, node.op.name)
     arg_order = arg_order or [*node.inputs, node.id]     # fallback: inputs, then output
-    sys.stdout.write(PTXEmitter(graph, node.op, arg_order, threads, smem_bytes).compile())
+
+    kop = node.op
+    kop = optimize(graph, kop)
+    sys.stdout.write(PTXEmitter(graph, kop, arg_order, threads, smem_bytes).compile())
 
 
 if __name__ == "__main__":
